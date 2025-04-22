@@ -1,0 +1,73 @@
+# --- General ---
+# Log files
+*.log
+LOG
+LOG.old
+
+# Lock files used by databases/caches
+LOCK
+
+# Database journal/state files
+*-journal
+*.db-journal
+*.db-wal
+CURRENT
+MANIFEST-*
+
+# Output files
+out.txt
+
+# --- Python ---
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Python Virtual Environments
+.env/
+.venv/
+env/
+venv/
+ENV/
+VENV/
+*/ENV/
+*/VENV/
+*/.env/
+*/.venv/
+
+# --- Project Specific Data/Cache ---
+# Ignore the main browser/scraper data directories recursively
+# These contain caches, databases, session data, components, etc.
+parser-data/
+enlister-data/
+
+# --- Config/Data Files ---
+# Ignore subscription files wherever they appear
+subscriptions.json
+
+# --- OS / Editor Files ---
+# MacOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+.directory
+
+# IDE/Editor config
+.vscode/
+.idea/
+*.swp
+*~
