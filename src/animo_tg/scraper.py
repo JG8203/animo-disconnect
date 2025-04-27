@@ -1,10 +1,12 @@
-"""Scrapes DLSU course enrollment data and provides an API endpoint."""
-
 import argparse
+import csv
 import json
 import logging
+import os
 import re
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -14,11 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 ENROLLMENT_URL = "https://enroll.dlsu.edu.ph/dlsu/view_course_offerings"
 DAY_PATTERN = re.compile(r"^[MTWFSH]$")
-
-
-class CloudflareBlockedError(RuntimeError):
-    """Raised when Cloudflare's challenge page is returned instead of data."""
-
+IDLE_TIMEOUT = 500
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,71 +26,107 @@ logging.basicConfig(
 logger = logging.getLogger("course_scraper")
 
 
+class CloudflareBlockedError(RuntimeError):
+    """Raised when Cloudflare's challenge page is returned instead of data."""
+
+
 @dataclass
 class Meeting:
-    """Represents a class meeting time and location."""
     day: str
     time: str
     room: Optional[str]
 
 
 def extract_table_cells(row) -> List[str]:
-    """Extract text from all table cells in a row."""
     return [td.text for td in row.eles("tag:td")]
 
 
+# --- Browser management ---
+_browser: Optional[Chromium] = None
+_idle_timer: Optional[threading.Timer] = None
+_browser_lock = threading.Lock()
+
+
+def close_browser():
+    global _browser, _idle_timer
+    with _browser_lock:
+        if _browser:
+            _browser.quit()
+            logger.debug("Idle timeout reached: closed browser")
+            _browser = None
+        if _idle_timer:
+            _idle_timer.cancel()
+            _idle_timer = None
+
+
+def get_browser() -> Chromium:
+    global _browser, _idle_timer
+    with _browser_lock:
+        if _browser is None:
+            browser_options = (
+                ChromiumOptions(read_file=False)
+                .set_load_mode("eager")
+                .set_local_port(9111)
+                #.set_user_data_path("parser-data")
+                #.add_extension("./proxy_ext")
+                #.set_flag("allow-legacy-mv2-extensions")
+            )
+            _browser = Chromium(browser_options)
+            logger.debug("Started new browser instance")
+        if _idle_timer:
+            _idle_timer.cancel()
+        _idle_timer = threading.Timer(IDLE_TIMEOUT, close_browser)
+        _idle_timer.daemon = True
+        _idle_timer.start()
+        logger.debug("Idle timer started.")
+        return _browser
+
+
+def write_csv(course_code: str, courses: List[Dict[str, Any]]) -> None:
+    """
+    Append each section's current enrolled count to <course_code>.csv.
+
+    Columns: timestamp, classNbr, section, enrolled
+    """
+    filename = f"{course_code}.csv"
+    is_new = not os.path.exists(filename)
+
+    with open(filename, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(["timestamp", "classNbr", "section", "enrolled"])
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        for sec in courses:
+            writer.writerow([ts, sec["classNbr"], sec["section"], sec["enrolled"]])
+
+
 def scrape(course_code: str, id_no: str) -> List[Dict[str, Any]]:
-    """
-    Scrape course information from the DLSU enrollment website.
-
-    Args:
-        course_code: The course code to search for (e.g., 'CSOPESY')
-        id_no: The student ID number
-
-    Returns:
-        A list of course sections with their details
-
-    Raises:
-        CloudflareBlockedError: If Cloudflare anti-bot protection is triggered
-    """
     logger.info("Scraping %s for ID %s", course_code, id_no)
-
-    url = (
-        f"{ENROLLMENT_URL}"
-        f"?p_id_no={id_no}&p_routine=1&p_last_name=&p_button=Search"
-        f"&p_course_code={course_code}"
-    )
-    logger.debug("URL => %s", url)
-
-    browser_options = (
-        ChromiumOptions(read_file=False)
-        .set_load_mode("eager")
-        .set_local_port(9111)
-        .set_user_data_path('parser-data')
-    )
-
-    browser = Chromium(browser_options)
+    browser = get_browser()
     tab = browser.latest_tab
-
     try:
+        # Navigate
+        url = (
+            f"{ENROLLMENT_URL}"
+            f"?p_id_no={id_no}&p_routine=1&p_last_name=&p_button=Search"
+            f"&p_course_code={course_code}"
+        )
         tab.get(url)
 
         html_lc = tab.html.lower()
-        if any(phrase in html_lc for phrase in [
-            "cf-browser-verification",
-            "just a moment",
-            "checking your browser"
-        ]):
+        if any(p in html_lc for p in ("cf-browser-verification", "just a moment", "checking your browser")):
             raise CloudflareBlockedError("Cloudflare verification page detected")
 
-        table_xpath = 'xpath://table[.//td[contains(normalize-space(.),"Class Nbr")]]'
-        if not tab.wait.ele_displayed(table_xpath, timeout=10):
+        # Wait for course table
+        xpath = 'xpath://table[.//td[contains(normalize-space(.),"Class Nbr")]]'
+        if not tab.wait.ele_displayed(xpath, timeout=10):
             raise CloudflareBlockedError("Timed out waiting for course table")
 
-        table = tab.ele(table_xpath)
+        table = tab.ele(xpath)
         if not table:
             raise CloudflareBlockedError("Course table not present")
 
+        # Parse table
         courses: List[Dict[str, Any]] = []
         current: Optional[Dict[str, Any]] = None
 
@@ -101,19 +135,15 @@ def scrape(course_code: str, id_no: str) -> List[Dict[str, Any]]:
             if not cells:
                 continue
 
-            first_cell = cells[0]
-
-            if first_cell.isdigit():
+            if cells[0].isdigit():
                 current = {
-                    "classNbr": int(first_cell),
+                    "classNbr": int(cells[0]),
                     "course": cells[1],
                     "section": cells[2],
                     "enrlCap": int(cells[6]),
                     "enrolled": int(cells[7]),
                     "remarks": cells[8],
-                    "meetings": [
-                        {"day": cells[3], "time": cells[4], "room": cells[5] or None}
-                    ],
+                    "meetings": [{"day": cells[3], "time": cells[4], "room": cells[5] or None}],
                 }
                 courses.append(current)
                 continue
@@ -130,52 +160,53 @@ def scrape(course_code: str, id_no: str) -> List[Dict[str, Any]]:
         logger.info("Found %d sections", len(courses))
         return courses
 
-    finally:
-        logger.debug("Session finished (%d open tab)", len(browser.tab_ids))
+    except CloudflareBlockedError as cf_err:
+        logger.warning("CloudflareBlockedError: %s ΓÇö opening my.dlsu.edu.ph as a new tab", cf_err)
+        try:
+            browser.new_tab("https://my.dlsu.edu.ph")
+        except Exception as tab_err:
+            logger.error("Failed to open fallback tab: %s", tab_err)
+        raise
 
 
+# --- FastAPI setup ---
 app = FastAPI(
     title="DLSU Course Scraper API",
-    version="0.2.0",
-    description="Scrapes DLSU enrollment listings on demand.",
+    version="0.3.0",
+    description="Scrapes DLSU enrollment listings and logs CSV per subject.",
 )
-
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"]
 )
 
 
 @app.get("/scrape")
 async def scrape_endpoint(course: str, id_no: str):
-    """API endpoint to scrape course information."""
     try:
-        return scrape(course, id_no)
-    except CloudflareBlockedError as e:
-        logger.warning("Cloudflare blocked: %s", e)
-        raise HTTPException(status_code=503, detail="cloudflare_blocked") from e
+        courses = scrape(course, id_no)
+        # write out CSV log
+        write_csv(course, courses)
+        return courses
+    except CloudflareBlockedError:
+        raise HTTPException(status_code=503, detail="cloudflare_blocked")
     except Exception as e:
-        logger.error("Error scraping %s: %s", course, e, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def main() -> None:
-    """Command-line interface for the scraper."""
-    parser = argparse.ArgumentParser(description="Scrape DLSU course offerings → JSON")
+    parser = argparse.ArgumentParser(description="Scrape DLSU course offerings as JSON/CSV")
     parser.add_argument("-c", "--course", default="CSOPESY", help="Course code")
-    parser.add_argument("-i", "--id", default="12209082", help="8-digit ID")
+    parser.add_argument("-i", "--id",     default="12209082", help="8-digit ID")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-
     args = parser.parse_args()
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
     try:
-        data = scrape(args.course, args.id)
-        print(json.dumps(data, indent=2, ensure_ascii=False))
+        courses = scrape(args.course, args.id)
+        write_csv(args.course, courses)
+        print(json.dumps(courses, indent=2, ensure_ascii=False))
     except Exception as e:
         logger.error("Scraping failed: %s", e, exc_info=True)
         sys.exit(1)
