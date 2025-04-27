@@ -47,7 +47,7 @@ VENV/
 # These contain caches, databases, session data, components, etc.
 parser-data/
 enlister-data/
-
+cookies/
 # --- Config/Data Files ---
 # Ignore subscription files wherever they appear
 subscriptions.json
